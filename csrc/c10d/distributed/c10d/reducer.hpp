@@ -1,3 +1,19 @@
+// Copyright (c) 2020 Huawei Technologies Co., Ltd
+// Copyright (c) 2019, Facebook CORPORATION. 
+// All rights reserved.
+//
+// Licensed under the BSD 3-Clause License  (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// https://opensource.org/licenses/BSD-3-Clause
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #pragma once
 
 #include <atomic>
@@ -15,13 +31,13 @@
 #include <torch/csrc/autograd/variable.h>
 #include <torch/csrc/distributed/autograd/context/context.h>
 
-namespace c10d {
+namespace c10d_npu {
 
 constexpr int kDefaultFirstBucketBytes = int(1024 * 1024);
 constexpr int kDefaultBucketBytesCap = int(25 * 1024 * 1024);
 
 class Reducer {
- public:
+public:
   // The constructor takes a list of variables for every model replica.
   // The bucket assignment for this reducer is specified as a list of
   // buckets, each of which is specified as a list of indices into the
@@ -61,7 +77,7 @@ class Reducer {
   // type to allow both Python and CPP hooks. This function can only
   // be called once before calling backward.
  // Cannot combine with the call of `register_builtin_comm_hook`.
-  void register_comm_hook(std::unique_ptr<CommHookInterface> iface);
+  void register_comm_hook(std::unique_ptr<c10d::CommHookInterface> iface);
 
   // Registers a built-in C++ comm hook to the reducer. This function can only
   // be called once before calling backward.
@@ -73,7 +89,7 @@ class Reducer {
 
   // Rebuild buckets based on rebuilt_params_ and rebuilt_param_indices_
   // according to when tensors received grads in the backward pass.
-  // TODO this function makes broadcast communication call and
+  // This function makes broadcast communication call and
   // could be overlapped with next forward() call, thus
   // it could be async. Will make it async when rebuilding buckets for
   // find_unused_parameters = true case, as we could rebuild buckets more than
@@ -117,7 +133,7 @@ class Reducer {
   // in the applications.
   c10::DDPLoggingData get_ddp_logging_data();
 
- protected:
+protected:
   // Forward declaration.
   struct Bucket;
   // Locates a specific variable by replica index and variable index.
@@ -249,7 +265,6 @@ class Reducer {
     // This is reset to `variables.size()` every iteration.
     size_t pending;
 
-    // TODO(@pietern)
     // Memory copies from gradient tensors into the bucket are potentially
     // done on different CUDA streams. We record an event for every copy
     // so that we can synchronize with them prior to kicking off the reduction.
@@ -367,9 +382,9 @@ class Reducer {
   // Division factor for reduction of gradients.
   int divFactor_;
 
- private:
+private:
   // comm_hook_ is used to access the DDP communication hook if registered.
-  std::unique_ptr<CommHookInterface> comm_hook_;
+  std::unique_ptr<c10d::CommHookInterface> comm_hook_;
 
   // ddp_logging_data_ is used to hold all the ddp related logging
   // data fields.
@@ -388,4 +403,4 @@ std::vector<std::vector<size_t>> compute_bucket_assignment_by_size(
     const std::vector<bool>& expect_sparse_gradient = {},
     const std::vector<int64_t>& tensor_indices = {});
 
-} // namespace c10d
+} // namespace c10d_npu

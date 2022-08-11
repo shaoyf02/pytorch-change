@@ -1,4 +1,19 @@
-#include <c10d/reducer.hpp>
+// Copyright (c) 2020 Huawei Technologies Co., Ltd
+// Copyright (c) 2019, Facebook CORPORATION. 
+// All rights reserved.
+//
+// Licensed under the BSD 3-Clause License  (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// https://opensource.org/licenses/BSD-3-Clause
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 #include <functional>
 
@@ -15,8 +30,22 @@
 #include <torch/csrc/autograd/utils/lambda_post_hook.h>
 #include <torch/csrc/utils/memory.h>
 
-namespace c10d {
+#include "torch_npu/csrc/distributed/reducer.hpp"
+#include "torch_npu/csrc/aten/NPUNativeFunctions.h"
+#include "torch_npu/csrc/framework/utils/OpPreparation.h"
+
+namespace c10d_npu {
 namespace {
+
+
+int64_t physical_numel(at::Tensor self){
+  auto sizes = self.storage().unsafeGetStorageImpl()->npu_desc_.storage_sizes_;
+  int64_t n = 1;
+  for (auto s : sizes) {
+    n *= s;
+  }
+  return n;
+}
 
 inline int64_t current_time_in_nanos() {
   return torch::autograd::profiler::getTime();
@@ -138,6 +167,13 @@ Reducer::Reducer(
         // The gradient accumulator is stored as weak_ptr in the autograd
         // metadata of the variable, so we have to keep it alive here for
         // the raw pointer to be valid.
+        TORCH_CHECK(
+            grad_accumulators_[replica_index][variable_index] == nullptr,
+            c10::str(
+                "Reducer tried to register duplicate grad accumulator for replica ",
+                replica_index,
+                " variable ",
+                variable_index));
         grad_accumulators_[replica_index][variable_index] =
             std::move(grad_accumulator);
       }
@@ -168,10 +204,10 @@ Reducer::Reducer(
         at::TensorOptions options;
         options = options.dtype(at::kInt);
 
-        if (replicas_[i][0].is_cuda()) {
+        if (replicas_[i][0].is_npu()) {
           at::DeviceGuard g(replicas_[i][0].device());
           local_used_maps_[i] = at::zeros(
-              {static_cast<long>(variable_count)}, options.pinned_memory(true));
+              {static_cast<long>(variable_count)}, options).pin_memory();
         } else {
           local_used_maps_[i] =
               at::zeros({static_cast<long>(variable_count)}, options);
@@ -203,7 +239,7 @@ Reducer::Reducer(
 // The reason for this is that the communication hook is expected to completely
 // override how we perform communication and the user should have complete
 // control over how the grads are handled.
-//
+
 // DDP communication hook is an enhancement that provides a hook which can be
 // used to override how DDP communicates gradients across ranks, this can be
 // used for algorithms like Gradient Compression/GossipGrad. This hook can be
@@ -299,7 +335,7 @@ void Reducer::verify_replica0_across_processes() {
   // Technically, process 0 doesn't need to double-check metadata, because it
   // was the source.  But no harm keeping work aligned.
   auto control = at::empty({static_cast<long>(i)}, options);
-  control.copy_(metadata_dev, /*non_blocking=*/false);
+  control.copy_(metadata_dev, false);
   auto control_accessor = control.accessor<int64_t, 1>();
   i = 0;
   for (size_t p = 0; p < replicas_[0].size(); p++) {
@@ -340,7 +376,6 @@ void Reducer::check_grad_layout(
       ", got ",
       grad.toString());
   TORCH_INTERNAL_ASSERT(grad.device() == bucket_view.device());
-  TORCH_INTERNAL_ASSERT(grad.numel() == bucket_view.numel());
   // AccumulateGrad doesn't HAVE to obey the grad layout contract.
   // The penalty for disobedience is reduced performance, not numerical
   // death. Warnings here help diagnose poor DDP performance.
@@ -372,12 +407,10 @@ void Reducer::copy_grad_to_bucket(
   // See Note [DDP Communication Hook]
   if (comm_hook_ == nullptr) {
     // imitates wrapped_scalar_tensor in ATen/native/BinaryOps.cpp
-    auto wrapped = c10::scalar_to_tensor(double(1.) / divFactor_);
-    wrapped.unsafeGetTensorImpl()->set_wrapped_number(true);
     // Divides while copying into the bucket view.
-    at::native::mul_out(bucket_view, grad, wrapped);
+    at_npu::native::NPUNativeFunctions::copy_memory_(bucket_view, grad.mul(float(1.) / divFactor_), true);
   } else {
-    bucket_view.copy_(grad);
+    at_npu::native::NPUNativeFunctions::copy_memory_(bucket_view, grad, true);
   }
 }
 
@@ -407,6 +440,12 @@ void Reducer::mark_variable_ready_dense(VariableIndex index) {
       // to bucket_view. If grad has already been set as views of buckets in
       // previous iterations, no copy is needed.
       if (!grad.is_alias_of(bucket_view)) {
+        // make sure grad has the same format as variable
+        if (grad.storage().unsafeGetStorageImpl()->npu_desc_.npu_format_ !=
+              variable.storage().unsafeGetStorageImpl()->npu_desc_.npu_format_) {
+          grad = at_npu::native::NPUNativeFunctions::npu_format_cast(grad,
+              variable.storage().unsafeGetStorageImpl()->npu_desc_.npu_format_);
+        }
         this->copy_grad_to_bucket(grad, bucket_view);
         if (gradient_as_bucket_view_) {
           // Let grad point to bucket_view buffer.
@@ -633,12 +672,6 @@ void Reducer::mark_variable_ready(VariableIndex index) {
     mark_variable_ready_dense(index);
   }
 
-  // TODO(@pietern): Make this work for both CPU/CUDA tensors.
-  // When using CPU tensors we don't need to do this.
-  // // Record event so that we can wait for all of them.
-  // auto& event = replica.events[bucket_index.intra_bucket_index];
-  // event.record();
-
   // Check if this was the final gradient for this bucket.
   if (--replica.pending == 0) {
     // Kick off reduction if all replicas for this bucket are ready.
@@ -696,7 +729,7 @@ void Reducer::mark_bucket_ready(size_t bucket_index) {
     std::vector<at::Tensor> tensors;
     tensors.reserve(bucket.replicas.size());
     for (const auto& replica : bucket.replicas) {
-      // TODO(@pietern): Ensure proper synchronization with the CUDA events
+      // Ensure proper synchronization with the CUDA events
       // that recorded copies into this contents tensor. If these copies are
       // executed on non-default streams, the current stream for the device
       // that holds the contents tensor must wait on these events.
@@ -708,12 +741,11 @@ void Reducer::mark_bucket_ready(size_t bucket_index) {
       tensors.push_back(replica.contents);
     }
     // See Note [DDP Communication Hook]
-    // TODO(@sinannasir): merge `work` and `future_work`. Related to GH Issue
-    // #41266.
+    // merge `work` and `future_work`. Related to GH Issue #41266.
     if (comm_hook_ == nullptr) {
       bucket.work = process_group_->allreduce(tensors);
     } else {
-      GradBucket grad_bucket(
+      c10d::GradBucket grad_bucket(
           next_bucket_,
           tensors,
           // Since currently we do not support single-process multiple-device
@@ -760,7 +792,6 @@ void Reducer::initialize_buckets(
   for (size_t bucket_index = 0; bucket_index < bucket_count; bucket_index++) {
     Bucket bucket;
 
-    // TODO(@pietern): Validate indices.
     // Must be non-empty, unique, and unique across buckets.
     TORCH_CHECK(
         bucket_indices[bucket_index].size() > 0, "Empty bucket specified.");
@@ -823,7 +854,7 @@ void Reducer::initialize_buckets(
                 variable.dtype() == options.dtype(),
                 "All parameters in a bucket must have the same dtype.");
           }
-          const auto length = variable.numel();
+          const auto length = physical_numel(variable);
           replica.variables.push_back(variable);
           replica.offsets.push_back(offset);
           replica.lengths.push_back(length);
@@ -903,19 +934,9 @@ void Reducer::initialize_bucket_views(
     auto& v = replica.variables[i];
     const auto offset = replica.offsets[i];
     const auto length = replica.lengths[i];
-    if (v.is_non_overlapping_and_dense()) {
-      // If the param's memory is dense, match its layout, anticipating
-      // the autograd engine (AccumulateGrad) will also create gradients
-      // matching its layout.
-      replica.bucket_views_in.push_back(
-          contents.as_strided(v.sizes(), v.strides(), offset));
-    } else {
-      // Fall back to a C-style contiguous view, again anticipating
-      // AccumulateGrad will do the same when stashing grads for non-dense
-      // params.
-      replica.bucket_views_in.push_back(
-          contents.narrow(0, offset, length).view(v.sizes()));
-    }
+
+    replica.bucket_views_in.push_back(
+        contents.narrow(0, offset, length));
     // By default `bucket_views_out` and `bucket_views_in` are
     // essentially the same thing.
     replica.bucket_views_out = replica.bucket_views_in;
@@ -954,19 +975,9 @@ void Reducer::populate_bucket_views_out(
     const auto& v = replica.variables[i];
     const auto offset = replica.offsets[i];
     const auto length = replica.lengths[i];
-    if (v.is_non_overlapping_and_dense()) {
-      // If the param's memory is dense, match its layout, anticipating
-      // the autograd engine (AccumulateGrad) will also create gradients
-      // matching its layout.
-      replica.bucket_views_out.push_back(
-          tensor.as_strided(v.sizes(), v.strides(), offset));
-    } else {
-      // Fall back to a C-style contiguous view, again anticipating
-      // AccumulateGrad will do the same when stashing grads for non-dense
-      // params.
-      replica.bucket_views_out.push_back(
-          tensor.narrow(0, offset, length).view(v.sizes()));
-    }
+
+    replica.bucket_views_out.push_back(
+        tensor.narrow(0, offset, length));
   }
 }
 
@@ -1027,7 +1038,7 @@ void Reducer::prepare_for_backward(
   }
 
   // Find accumulator functions that don't show up in this graph.
-  for (const auto& it : gradAccToVariablesMap_) {
+    for (const auto& it : gradAccToVariablesMap_) {
     // If the accumulator function is present in the graph, we know
     // a gradient will be computed for the corresponding parameter.
     if (seen.count(it.first) == 0) {
@@ -1063,10 +1074,12 @@ void Reducer::copy_bucket_to_grad(
       if (!grad.defined()) {
         // Creates grad according to the "Gradient Layout Contract"
         // (see torch/csrc/grad/AccumulateGrad.h)
-        grad =
-            torch::autograd::utils::clone_obey_contract(bucket_view, variable);
+        grad = at_npu::native::OpPreparation::ApplyTensorWithFormat(
+            variable.sizes(), bucket_view.options(),
+            variable.storage().unsafeGetStorageImpl()->npu_desc_.npu_format_);
+        at_npu::native::NPUNativeFunctions::copy_memory_(grad, bucket_view, true);
       } else {
-        grad.copy_(bucket_view);
+        at_npu::native::NPUNativeFunctions::copy_memory_(grad, bucket_view, true);
       }
       // The grad is modified and needs to be written back.
       return true;
@@ -1307,10 +1320,10 @@ void Reducer::sync_bucket_indices(
   // Copy CPU tensor to device tensor, as the process_group_ could be NCCL and
   // it can only broadcast device tensors.
   auto indices_tensor_device = at::empty({total_size + 1}, options);
-  indices_tensor_device.copy_(indices_tensor, /*non_blocking=*/true);
+  indices_tensor_device.copy_(indices_tensor, true);
   std::vector<at::Tensor> indices_tensor_list = {indices_tensor_device};
   process_group_->broadcast(indices_tensor_list)->wait();
-  indices_tensor.copy_(indices_tensor_list.front(), /*non_blocking=*/false);
+  indices_tensor.copy_(indices_tensor_list.front(), false);
 
   // Update num_buckets after receiving it from rank 0
   num_buckets = indices_accessor[indices_accessor_Index];
@@ -1325,12 +1338,12 @@ void Reducer::sync_bucket_indices(
         bucket_sizes.at(std::min(i, (bucket_sizes.size() - 1)));
   }
   auto bucket_sizes_tensor_device = at::empty({(int64_t)num_buckets}, options);
-  bucket_sizes_tensor_device.copy_(bucket_sizes_tensor, /*non_blocking=*/true);
+  bucket_sizes_tensor_device.copy_(bucket_sizes_tensor, true);
   std::vector<at::Tensor> bucket_sizes_tensor_list = {
       bucket_sizes_tensor_device};
   process_group_->broadcast(bucket_sizes_tensor_list)->wait();
   bucket_sizes_tensor.copy_(
-      bucket_sizes_tensor_list.front(), /*non_blocking=*/false);
+      bucket_sizes_tensor_list.front(), false);
 
   // Clear bucket_indices first, and then update bucket_indices using received
   // num_buckets, bucket_sizes_tensor and indices_tensor from rank 0
@@ -1398,12 +1411,11 @@ bool Reducer::rebuild_buckets() {
 }
 
 // See Note [DDP Communication Hook]
-void Reducer::register_comm_hook(std::unique_ptr<CommHookInterface> iface) {
+void Reducer::register_comm_hook(std::unique_ptr<c10d::CommHookInterface> iface) {
   TORCH_CHECK(
       comm_hook_ == nullptr,
       "register_comm_hook or register_builtin_comm_hook can only be called once.");
-  // TODO(#42542): Single-process multiple-device mode support for DDP
-  // communication hook.
+  // Single-process multiple-device mode support for DDP communication hook.
   TORCH_CHECK(
       replicas_.size() == 1,
       "Communication hook does not support single-process multiple-device mode.");
@@ -1420,11 +1432,6 @@ void Reducer::register_builtin_comm_hook(
   TORCH_CHECK(
       replicas_.size() == 1,
       "Communication hook does not support single-process multiple-device mode.");
-  // TODO: Support GLOO and MPI backends for DDP communication hook.
-  TORCH_CHECK(
-      process_group_->getBackendName() == "nccl",
-      "register_builtin_comm_hook currently can only support NCCL backend, but the current backend is %s.",
-      process_group_->getBackendName());
 
   switch (comm_hook_type) {
     case c10d::BuiltinCommHookType::ALLREDUCE:
@@ -1571,7 +1578,7 @@ std::vector<std::vector<size_t>> compute_bucket_assignment_by_size(
     auto key = BucketKey(tensor.scalar_type(), tensor.device());
     auto& bucket = buckets[key];
     bucket.indices.push_back(tensor_index);
-    bucket.size += tensor.numel() * tensor.element_size();
+    bucket.size += physical_numel(tensor) * tensor.element_size();
 
     // Initialize bucket size limit iterator if necessary.
     if (bucket_size_limit_iterators.count(key) == 0) {
@@ -1621,4 +1628,4 @@ std::vector<std::vector<size_t>> compute_bucket_assignment_by_size(
   return result;
 }
 
-} // namespace c10d
+} // namespace c10d_npu
