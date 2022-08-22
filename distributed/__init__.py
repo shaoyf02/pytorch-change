@@ -1,6 +1,16 @@
+import torch_npu
 
-import torch
-import sys
+
+__all__ = [
+    "Backend", "_backend", "group", "GroupMember", "is_hccl_available", "is_initialized",
+    "get_backend", "init_process_group", "destroy_process_group", "get_rank", "get_world_size",
+    "isend", "irecv", "send", "recv", "P2POp", "batch_isend_irecv", "broadcast", "all_reduce",
+    "all_reduce_coalesced", "reduce",  "all_gather", "all_gather_coalesced", "gather", "scatter",
+    "reduce_scatter", "all_to_all_single", "all_to_all", "barrier", "new_group", "ProcessGroupHCCL",
+    "Reducer", "_DEFAULT_FIRST_BUCKET_BYTES", "_register_comm_hook", "_register_builtin_comm_hook",
+    "_broadcast_coalesced", "_compute_bucket_assignment_by_size", "_set_construction_logging_data",
+    "_get_ddp_logging_data", "_get_global_rank"
+]
 
 
 def is_available():
@@ -12,40 +22,28 @@ def is_available():
     Currently, the default value is ``USE_DISTRIBUTED=1`` for Linux and Windows,
     ``USE_DISTRIBUTED=0`` for MacOS.
     """
-    return hasattr(torch._C, "_c10d_init")
+    return hasattr(torch_npu._C, "_c10d_init")
 
 
-if is_available() and not torch._C._c10d_init():
-    raise RuntimeError("Failed to initialize torch.distributed")
+if is_available() and not torch_npu._C._c10d_init():
+    raise RuntimeError("Failed to initialize torch_npu.distributed")
 
 
-if is_available():
-    from torch._C._distributed_c10d import (
-        Store,
-        FileStore,
-        TCPStore,
-        ProcessGroup,
-        Reducer,
-        BuiltinCommHookType,
-        _DEFAULT_FIRST_BUCKET_BYTES,
-        _GradBucket,
-        _register_comm_hook,
-        _register_builtin_comm_hook,
-        _broadcast_coalesced,
-        _compute_bucket_assignment_by_size,
-        _test_python_store,
-        _set_construction_logging_data,
-        _get_ddp_logging_data
-    )
-    if sys.platform != 'win32':
-        from torch._C._distributed_c10d import (
-            HashStore,
-            _round_robin_process_groups,
-        )
-
-    from .distributed_c10d import *
-    # Variables prefixed with underscore are not auto imported
-    # See the comment in `distributed_c10d.py` above `_backend` on why we expose
-    # this.
-
-    from .distributed_c10d import _backend
+from torch_npu._C._distributed_c10d import (
+    Reducer,
+    _DEFAULT_FIRST_BUCKET_BYTES,
+    _register_comm_hook,
+    _register_builtin_comm_hook, 
+    _broadcast_coalesced,
+    _compute_bucket_assignment_by_size,
+    _set_construction_logging_data,
+    _get_ddp_logging_data
+)
+from .distributed_c10d import Group as group
+from .distributed_c10d import (
+    _backend, Backend, GroupMember, is_hccl_available, is_initialized, get_backend,
+    init_process_group, destroy_process_group, get_rank, get_world_size, isend,
+    irecv, send, recv, P2POp, batch_isend_irecv, broadcast, all_reduce, all_reduce_coalesced,
+    reduce, all_gather, all_gather_coalesced, gather, scatter, reduce_scatter,
+    all_to_all_single, all_to_all, barrier, new_group, ProcessGroupHCCL, _get_global_rank
+)

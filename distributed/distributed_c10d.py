@@ -1,18 +1,30 @@
+# Copyright (c) 2020 Huawei Technologies Co., Ltd
+# Copyright (c) 2019, Facebook CORPORATION. 
+# All rights reserved.
+#
+# Licensed under the BSD 3-Clause License  (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# https://opensource.org/licenses/BSD-3-Clause
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import contextlib
 import logging
-import pickle
-import torch
-import warnings
 import time
-from torch._six import string_classes
+import warnings
 from datetime import timedelta
 from typing import Dict, Optional, Tuple, Union
 
-# This module is wildcard imported from torch.distributed.
-# TODO: specify __all__
-
-from .constants import default_pg_timeout
-from .rendezvous import rendezvous, register_rendezvous_handler  # noqa: F401
+import torch
+from torch._six import string_classes
+from torch.distributed.constants import default_pg_timeout
+from torch.distributed.rendezvous import rendezvous  # noqa: F401
 from torch._C._distributed_c10d import (
     AllreduceOptions,
     AllreduceCoalescedOptions,
@@ -32,7 +44,7 @@ from torch._C._distributed_c10d import (
 _MPI_AVAILABLE = True
 _NCCL_AVAILABLE = True
 _GLOO_AVAILABLE = True
-
+_HCCL_AVAILABLE = True
 
 try:
     from torch._C._distributed_c10d import ProcessGroupMPI
@@ -48,6 +60,20 @@ try:
     from torch._C._distributed_c10d import ProcessGroupGloo
 except ImportError:
     _GLOO_AVAILABLE = False
+
+try:
+    from torch_npu._C._distributed_c10d import ProcessGroupHCCL
+except ImportError:
+    _HCCL_AVAILABLE = False
+
+__all__ = [
+    "Backend", "_backend", "Group", "GroupMember", "is_hccl_available", "is_initialized",
+    "get_backend", "init_process_group", "destroy_process_group", "get_rank", "get_world_size",
+    "isend", "irecv", "send", "recv", "P2POp", "batch_isend_irecv", "broadcast", "all_reduce",
+    "all_reduce_coalesced", "reduce", "all_gather", "all_gather_coalesced", "gather", "scatter",
+    "reduce_scatter", "all_to_all_single", "all_to_all", "barrier", "new_group", "ProcessGroupHCCL",
+    "_get_default_group", "_get_global_rank"
+]
 
 # Some reduce ops are not supported by complex numbers and will result in an error.
 # We currently provide complex support to the distributed API by viewing
@@ -84,6 +110,7 @@ class Backend(object):
     NCCL = "nccl"
     MPI = "mpi"
     TCP = "tcp"
+    HCCL = "hccl"
 
     def __new__(cls, name: str):
         if not isinstance(name, string_classes):
@@ -148,14 +175,14 @@ class _reduce_op(object):
 reduce_op = _reduce_op()
 
 
-class group(object):
+class Group(object):
     # Points to the default PG once initialized.
     WORLD: Optional[ProcessGroup] = None
 
 
 class GroupMember(object):
-    # Alias to group.WORLD for backward compatibility
-    WORLD = group.WORLD
+    # Alias to Group.WORLD for backward compatibility
+    WORLD = Group.WORLD
     NON_GROUP_MEMBER = object()
 
 
@@ -229,7 +256,7 @@ def _get_group_rank(group: ProcessGroup, rank):
     rank.
     """
     if group is GroupMember.WORLD:
-        raise RuntimeError("group.WORLD does not have local rank to global "
+        raise RuntimeError("Group.WORLD does not have local rank to global "
                            "rank mapping")
     if group not in _pg_group_ranks:
         raise RuntimeError("The given group does not exist")
@@ -246,7 +273,7 @@ def _get_global_rank(group, group_rank):
     group.
     """
     if group is GroupMember.WORLD:
-        raise RuntimeError("group.WORLD does not have local rank to global "
+        raise RuntimeError("Group.WORLD does not have local rank to global "
                            "rank mapping")
     group_rank_map = _pg_group_ranks[group]
     for rank, grp_rank in group_rank_map.items():
@@ -331,6 +358,12 @@ def is_gloo_available():
     """
     return _GLOO_AVAILABLE
 
+def is_hccl_available():
+    """
+    Checks if the HCCL backend is available.
+
+    """
+    return _HCCL_AVAILABLE
 
 def is_initialized():
     """
@@ -361,7 +394,7 @@ def _get_default_store():
     return default_store
 
 def _update_default_pg(pg):
-    GroupMember.WORLD = group.WORLD = pg
+    GroupMember.WORLD = Group.WORLD = pg
 
 
 def get_backend(group=None):
@@ -388,13 +421,8 @@ def get_backend(group=None):
     return pg_store[0]
 
 
-def init_process_group(backend,
-                       init_method=None,
-                       timeout=default_pg_timeout,
-                       world_size=-1,
-                       rank=-1,
-                       store=None,
-                       group_name=''):
+def init_process_group(backend, init_method=None, timeout=default_pg_timeout,
+                       world_size=-1, rank=-1, store=None, group_name=''):
     """
     Initializes the default distributed process group, and this will also
     initialize the distributed package.
@@ -483,14 +511,8 @@ def init_process_group(backend,
                 "are ignored since they are assigned by the "
                 "MPI runtime.".format(world_size, rank))
 
-        _update_default_pg(_new_process_group_helper(
-            -1,
-            -1,
-            [],
-            Backend.MPI,
-            None,
-            group_name=group_name,
-            timeout=timeout))
+        _update_default_pg(_new_process_group_helper(-1, -1, [], Backend.MPI, None, group_name=group_name,
+                                                     timeout=timeout))
     else:
         # backward compatible API
         if store is None:
@@ -500,14 +522,8 @@ def init_process_group(backend,
             store, rank, world_size = next(rendezvous_iterator)
             store.set_timeout(timeout)
 
-        _update_default_pg(_new_process_group_helper(
-            world_size,
-            rank,
-            [],
-            backend,
-            store,
-            group_name=group_name,
-            timeout=timeout))
+        _update_default_pg(_new_process_group_helper(world_size, rank, [], backend, store,
+                                                     group_name=group_name, timeout=timeout))
 
     _pg_group_ranks[GroupMember.WORLD] = {i: i for i in range(GroupMember.WORLD.size())}  # type: ignore
     _backend = _pg_map[GroupMember.WORLD][0]  # type: ignore
@@ -524,12 +540,8 @@ def init_process_group(backend,
         # default devices and messes up NCCL internal state.
         _store_based_barrier(rank, store, timeout)
 
-def _new_process_group_helper(world_size,
-                              rank,
-                              group_ranks,
-                              backend,
-                              store,
-                              group_name=None,
+
+def _new_process_group_helper(world_size, rank, group_ranks, backend, store, group_name=None,
                               timeout=default_pg_timeout):
     """
     Create a new distributed process group.
@@ -549,24 +561,21 @@ def _new_process_group_helper(world_size,
         _group_count += 1
 
     if group_name in _pg_names.values():
-        raise RuntimeError("The specified group name has already been "
-                           "created, please use a different group name")
+        raise RuntimeError("The specified group name has already been created, please use a different group name")
 
     if not isinstance(timeout, timedelta):
-        raise RuntimeError("Expected timeout argument to be of type"
-                           "datetime.timedelta")
+        raise RuntimeError("Expected timeout argument to be of type datetime.timedelta")
 
     # The list of group ranks is empty if we're creating the default group.
     is_default_group = (len(group_ranks) == 0)
 
     backend = Backend(backend)
-    pg: Union[ProcessGroupGloo, ProcessGroupMPI, ProcessGroupNCCL]
+    pg: Union[ProcessGroupGloo, ProcessGroupMPI, ProcessGroupNCCL, ProcessGroupHCCL]
     if backend == Backend.MPI:
         if not is_mpi_available():
-            raise RuntimeError(
-                "Distributed package doesn't have MPI built in."
-                " MPI is only included if you build PyTorch from"
-                " source on a host that has MPI installed.")
+            raise RuntimeError("Distributed package doesn't have MPI built in."
+                               " MPI is only included if you build PyTorch from"
+                               " source on a host that has MPI installed.")
         pg = ProcessGroupMPI.create(group_ranks)
         if not pg:
             return GroupMember.NON_GROUP_MEMBER
@@ -585,30 +594,23 @@ def _new_process_group_helper(world_size,
         prefix_store = PrefixStore(group_name, store)
 
         if backend == Backend.GLOO:
-            pg = ProcessGroupGloo(
-                prefix_store,
-                rank,
-                world_size,
-                timeout=timeout)
+            pg = ProcessGroupGloo(prefix_store, rank, world_size, timeout=timeout)
             _pg_map[pg] = (Backend.GLOO, store)
             _pg_names[pg] = group_name
         elif backend == Backend.NCCL:
             if not is_nccl_available():
-                raise RuntimeError("Distributed package doesn't have NCCL "
-                                   "built in")
-            pg = ProcessGroupNCCL(
-                prefix_store,
-                rank,
-                world_size,
-                timeout)
+                raise RuntimeError("Distributed package doesn't have NCCL built in")
+            pg = ProcessGroupNCCL(prefix_store, rank, world_size, timeout)
             _pg_map[pg] = (Backend.NCCL, store)
             _pg_names[pg] = group_name
+        elif backend == Backend.HCCL:
+            if not is_hccl_available():
+                raise RuntimeError("Distributed package doesn't have HCCL built in")
+            pg = ProcessGroupHCCL(prefix_store, rank, world_size)
+            _pg_map[pg] = (Backend.HCCL, store)
+            _pg_names[pg] = group_name
         else:
-            pg = getattr(Backend, backend.upper())(
-                prefix_store,
-                rank,
-                world_size,
-                timeout)
+            pg = getattr(Backend, backend.upper())(prefix_store, rank, world_size, timeout)
             _pg_map[pg] = (backend, store)
             _pg_names[pg] = group_name
 
@@ -621,7 +623,7 @@ def destroy_process_group(group=None):
 
     Args:
         group (ProcessGroup, optional): The process group to be destroyed, if
-                                        group.WORLD is given, all process
+                                        Group.WORLD is given, all process
                                         groups including the default one will
                                         be destroyed.
     """
@@ -947,62 +949,6 @@ def batch_isend_irecv(p2p_op_list):
     return reqs
 
 
-def broadcast_multigpu(tensor_list,
-                       src,
-                       group=None,
-                       async_op=False,
-                       src_tensor=0):
-    """
-    Broadcasts the tensor to the whole group with multiple GPU tensors
-    per node.
-
-    ``tensor`` must have the same number of elements in all the GPUs from
-    all processes participating in the collective. each tensor in the list must
-    be on a different GPU
-
-    Only nccl and gloo backend are currently supported
-    tensors should only be GPU tensors
-
-    Args:
-        tensor_list (List[Tensor]): Tensors that participate in the collective
-            operation. If ``src`` is the rank, then the specified ``src_tensor``
-            element of ``tensor_list`` (``tensor_list[src_tensor]``) will be
-            broadcast to all other tensors (on different GPUs) in the src process
-            and all tensors in ``tensor_list`` of other non-src processes.
-            You also need to make sure that ``len(tensor_list)`` is the same
-            for all the distributed processes calling this function.
-
-        src (int): Source rank.
-        group (ProcessGroup, optional): The process group to work on. If None,
-            the default process group will be used.
-        async_op (bool, optional): Whether this op should be an async op
-        src_tensor (int, optional): Source tensor rank within ``tensor_list``
-
-    Returns:
-        Async work handle, if async_op is set to True.
-        None, if not async_op or if not part of the group
-
-    """
-    if _rank_not_in_group(group):
-        return
-
-    opts = BroadcastOptions()
-    opts.rootRank = src
-    opts.rootTensor = src_tensor
-
-    if group is None or group is GroupMember.WORLD:
-        default_pg = _get_default_group()
-        work = default_pg.broadcast(tensor_list, opts)
-    else:
-        group_src_rank = _get_group_rank(group, src)
-        opts.rootRank = group_src_rank
-        work = group.broadcast(tensor_list, opts)
-    if async_op:
-        return work
-    else:
-        work.wait()
-
-
 def broadcast(tensor,
               src,
               group=None,
@@ -1041,62 +987,6 @@ def broadcast(tensor,
         group_src_rank = _get_group_rank(group, src)
         opts.rootRank = group_src_rank
         work = group.broadcast([tensor], opts)
-    if async_op:
-        return work
-    else:
-        work.wait()
-
-
-def all_reduce_multigpu(tensor_list,
-                        op=ReduceOp.SUM,
-                        group=None,
-                        async_op=False):
-    r"""
-    Reduces the tensor data across all machines in such a way that all get
-    the final result. This function reduces a number of tensors on every node,
-    while each tensor resides on different GPUs.
-    Therefore, the input tensor in the tensor list needs to be GPU tensors.
-    Also, each tensor in the tensor list needs to reside on a different GPU.
-
-    After the call, all ``tensor`` in ``tensor_list`` is going to be bitwise
-    identical in all processes.
-
-    Complex tensors are supported.
-
-    Only nccl and gloo backend is currently supported
-    tensors should only be GPU tensors
-
-    Args:
-        tensor list (List[Tensor]): List of input and output tensors of
-            the collective. The function operates in-place and requires that
-            each tensor to be a GPU tensor on different GPUs.
-            You also need to make sure that ``len(tensor_list)`` is the same for
-            all the distributed processes calling this function.
-        op (optional): One of the values from
-            ``torch.distributed.ReduceOp``
-            enum.  Specifies an operation used for element-wise reductions.
-        group (ProcessGroup, optional): The process group to work on. If None,
-            the default process group will be used.
-        async_op (bool, optional): Whether this op should be an async op
-
-    Returns:
-        Async work handle, if async_op is set to True.
-        None, if not async_op or if not part of the group
-
-    """
-    if _rank_not_in_group(group):
-        return
-
-    tensor_list = [t if not t.is_complex() else torch.view_as_real(t) for t in tensor_list]
-
-    opts = AllreduceOptions()
-    opts.reduceOp = op
-    if group is None:
-        default_pg = _get_default_group()
-        work = default_pg.allreduce(tensor_list, opts)
-    else:
-        work = group.allreduce(tensor_list, opts)
-
     if async_op:
         return work
     else:
@@ -1235,64 +1125,6 @@ def all_reduce_coalesced(tensors,
         work.wait()
 
 
-def reduce_multigpu(tensor_list,
-                    dst,
-                    op=ReduceOp.SUM,
-                    group=None,
-                    async_op=False,
-                    dst_tensor=0):
-    """
-    Reduces the tensor data on multiple GPUs across all machines. Each tensor
-    in ``tensor_list`` should reside on a separate GPU
-
-    Only the GPU of ``tensor_list[dst_tensor]`` on the process with rank ``dst``
-    is going to receive the final result.
-
-    Only nccl backend is currently supported
-    tensors should only be GPU tensors
-
-    Args:
-        tensor_list (List[Tensor]): Input and output GPU tensors of the
-            collective. The function operates in-place.
-            You also need to make sure that ``len(tensor_list)`` is the same for
-            all the distributed processes calling this function.
-        dst (int): Destination rank
-        op (optional): One of the values from
-            ``torch.distributed.ReduceOp``
-            enum.  Specifies an operation used for element-wise reductions.
-        group (ProcessGroup, optional): The process group to work on. If None,
-            the default process group will be used.
-        async_op (bool, optional): Whether this op should be an async op
-        dst_tensor (int, optional): Destination tensor rank within
-                                    ``tensor_list``
-
-    Returns:
-        Async work handle, if async_op is set to True.
-        None, otherwise
-
-    """
-    if _rank_not_in_group(group):
-        return
-
-    opts = ReduceOptions()
-    opts.reduceOp = op
-    opts.rootRank = dst
-    opts.rootTensor = dst_tensor
-
-    if group is None or group is GroupMember.WORLD:
-        default_pg = _get_default_group()
-        work = default_pg.reduce(tensor_list, opts)
-    else:
-        group_dst_rank = _get_group_rank(group, dst)
-        opts.rootRank = group_dst_rank
-        work = group.reduce(tensor_list, opts)
-
-    if async_op:
-        return work
-    else:
-        work.wait()
-
-
 def reduce(tensor,
            dst,
            op=ReduceOp.SUM,
@@ -1319,485 +1151,36 @@ def reduce(tensor,
         None, if not async_op or if not part of the group
 
     """
+    if async_op:
+        raise RuntimeError("Reduce implemented by all_reduce: "
+                           "not support async")
+        return
+
     _check_single_tensor(tensor, "tensor")
     if _rank_not_in_group(group):
         return
 
-    opts = ReduceOptions()
+    opts = AllreduceOptions()
     opts.reduceOp = op
-    opts.rootRank = dst
 
     if group is None or group is GroupMember.WORLD:
         default_pg = _get_default_group()
-        work = default_pg.reduce([tensor], opts)
+        group_dst_rank = dst
+        current_rank = get_rank()
+        tensor_tmp = tensor.clone()
+        work = default_pg.allreduce([tensor_tmp], opts)
     else:
         group_dst_rank = _get_group_rank(group, dst)
-        opts.rootRank = group_dst_rank
-        work = group.reduce([tensor], opts)
+        current_rank = get_rank(group)
+        tensor_tmp = tensor.clone()
+        work = group.allreduce([tensor_tmp], opts)
 
     if async_op:
         return work
     else:
         work.wait()
-
-
-def all_gather_multigpu(output_tensor_lists,
-                        input_tensor_list,
-                        group=None,
-                        async_op=False):
-    """
-    Gathers tensors from the whole group in a list.
-    Each tensor in ``tensor_list`` should reside on a separate GPU
-
-    Only nccl backend is currently supported
-    tensors should only be GPU tensors
-
-    Complex tensors are supported.
-
-    Args:
-        output_tensor_lists (List[List[Tensor]]): Output lists. It should
-            contain correctly-sized tensors on each GPU to be used for output
-            of the collective, e.g. ``output_tensor_lists[i]`` contains the
-            all_gather result that resides on the GPU of
-            ``input_tensor_list[i]``.
-
-            Note that each element of ``output_tensor_lists`` has the size of
-            ``world_size * len(input_tensor_list)``, since the function all
-            gathers the result from every single GPU in the group. To interpret
-            each element of ``output_tensor_lists[i]``, note that
-            ``input_tensor_list[j]`` of rank k will be appear in
-            ``output_tensor_lists[i][k * world_size + j]``
-
-            Also note that ``len(output_tensor_lists)``, and the size of each
-            element in ``output_tensor_lists`` (each element is a list,
-            therefore ``len(output_tensor_lists[i])``) need to be the same
-            for all the distributed processes calling this function.
-
-        input_tensor_list (List[Tensor]): List of tensors(on different GPUs) to
-            be broadcast from current process.
-            Note that ``len(input_tensor_list)`` needs to be the same for
-            all the distributed processes calling this function.
-
-        group (ProcessGroup, optional): The process group to work on. If None,
-            the default process group will be used.
-        async_op (bool, optional): Whether this op should be an async op
-
-    Returns:
-        Async work handle, if async_op is set to True.
-        None, if not async_op or if not part of the group
-
-    """
-    if _rank_not_in_group(group):
-        return
-
-    output_tensor_lists = [[t if not t.is_complex() else torch.view_as_real(t) for t in l] for l in output_tensor_lists]
-    input_tensor_list = [t if not t.is_complex() else torch.view_as_real(t) for t in input_tensor_list]
-
-    if group is None:
-        default_pg = _get_default_group()
-        work = default_pg.allgather(output_tensor_lists, input_tensor_list)
-    else:
-        work = group.allgather(output_tensor_lists, input_tensor_list)
-
-    if async_op:
-        return work
-    else:
-        work.wait()
-
-
-def _object_to_tensor(obj):
-    buffer = pickle.dumps(obj)
-    byte_storage = torch.ByteStorage.from_buffer(buffer)  # type: ignore[attr-defined]
-    byte_tensor = torch.ByteTensor(byte_storage)
-    local_size = torch.LongTensor([byte_tensor.numel()])
-    return byte_tensor, local_size
-
-
-def _tensor_to_object(tensor, tensor_size):
-    buf = tensor.numpy().tobytes()[:tensor_size]
-    out = pickle.loads(buf)
-    return out
-
-
-def all_gather_object(object_list, obj, group=None):
-    """
-    Gathers picklable objects from the whole group into a list. Similar to
-    :func:`all_gather`, but Python objects can be passed in. Note that the object
-    must be picklable in order to be gathered.
-
-    Args:
-        object_list (list[Any]): Output list. It should be correctly sized as the
-            size of the group for this collective and will contain the output.
-        object (Any): Pickable Python object to be broadcast from current process.
-        group (ProcessGroup, optional): The process group to work on. If None,
-            the default process group will be used. Default is ``None``.
-
-    Returns:
-        None. If the calling rank is part of this group, the output of the
-        collective will be populated into the input ``object_list``. If the
-        calling rank is not part of the group, the passed in ``object_list`` will
-        be unmodified.
-
-    .. note:: Note that this API differs slightly from the :func:`all_gather`
-        collective since it does not provide an ``async_op`` handle and thus
-        will be a blocking call.
-
-    .. note:: For NCCL-based processed groups, internal tensor representations
-        of objects must be moved to the GPU device before communication takes
-        place. In this case, the device used is given by
-        ``torch.cuda.current_device()`` and it is the user's responsiblity to
-        ensure that this is set so that each rank has an individual GPU, via
-        ``torch.cuda.set_device()``.
-
-    .. warning::
-        :func:`all_gather_object` uses ``pickle`` module implicitly, which is
-        known to be insecure. It is possible to construct malicious pickle data
-        which will execute arbitrary code during unpickling. Only call this
-        function with data you trust.
-
-    Example::
-        >>> # Note: Process group initialization omitted on each rank.
-        >>> import torch.distributed as dist
-        >>> # Assumes world_size of 3.
-        >>> gather_objects = ["foo", 12, {1: 2}] # any picklable object
-        >>> output = [None for _ in gather_objects]
-        >>> dist.all_gather_object(output, gather_objects[dist.get_rank()])
-        >>> output
-        ['foo', 12, {1: 2}]
-    """
-    if _rank_not_in_group(group):
-        return
-
-    input_tensor, local_size = _object_to_tensor(obj)
-    group_backend = get_backend(group)
-    is_nccl_backend = group_backend == Backend.NCCL
-    current_device = torch.device("cpu")
-    if is_nccl_backend:
-        # See note about using torch.cuda.current_device() here in docstring.
-        # We cannot simply use my_rank since rank == device is not necessarily
-        # true.
-        current_device = torch.device('cuda', torch.cuda.current_device())
-        input_tensor = input_tensor.to(current_device)
-        local_size = local_size.to(current_device)
-    # Gather all local sizes. This is so that we can find the max size, and index
-    # until the correct size when deserializing the tensors.
-    group_size = get_world_size(group=group)
-    object_sizes_tensor = torch.zeros(group_size, dtype=torch.long, device=current_device)
-    object_size_list = [
-        object_sizes_tensor[i].unsqueeze(dim=0) for i in range(group_size)
-    ]
-    # Allgather tensor sizes
-    all_gather(object_size_list, local_size, group=group)
-    max_object_size = int(max(object_size_list).item())  # type: ignore
-    # Resize tensor to max size across all ranks.
-    input_tensor.resize_(max_object_size)
-    coalesced_output_tensor = torch.empty(
-        max_object_size * group_size, dtype=torch.uint8, device=current_device
-    )
-    # Output tensors are nonoverlapping views of coalesced_output_tensor
-    output_tensors = [
-        coalesced_output_tensor[max_object_size * i : max_object_size * (i + 1)]
-        for i in range(group_size)
-    ]
-    all_gather(output_tensors, input_tensor, group=group)
-    # Deserialize outputs back to object.
-    for i, tensor in enumerate(output_tensors):
-        tensor = tensor.type(torch.ByteTensor)  # type:ignore[call-overload]
-        tensor_size = object_size_list[i]
-        object_list[i] = _tensor_to_object(tensor, tensor_size)
-
-
-def gather_object(obj, object_gather_list=None, dst=0, group=None):
-    """
-    Gathers picklable objects from the whole group in a single process.
-    Similar to :func:`gather`, but Python objects can be passed in. Note that the
-    object must be picklable in order to be gathered.
-
-    Args:
-        obj (Any): Input object. Must be picklable.
-        object_gather_list (list[Any]): Output list. On the ``dst`` rank, it
-            should be correctly sized as the size of the group for this
-            collective and will contain the output. Must be ``None`` on non-dst
-            ranks. (default is ``None``)
-        dst (int, optional): Destination rank. (default is 0)
-        group: (ProcessGroup, optional): The process group to work on. If None,
-            the default process group will be used. Default is ``None``.
-
-    Returns:
-        None. On the ``dst`` rank, ``object_gather_list`` will contain the
-        output of the collective.
-
-    .. note:: Note that this API differs slightly from the gather collective
-        since it does not provide an async_op handle and thus will be a blocking
-        call.
-
-    .. note:: Note that this API is not supported when using the NCCL backend.
-
-    .. warning::
-        :func:`gather_object` uses ``pickle`` module implicitly, which is
-        known to be insecure. It is possible to construct malicious pickle data
-        which will execute arbitrary code during unpickling. Only call this
-        function with data you trust.
-
-    Example::
-        >>> # Note: Process group initialization omitted on each rank.
-        >>> import torch.distributed as dist
-        >>> # Assumes world_size of 3.
-        >>> gather_objects = ["foo", 12, {1: 2}] # any picklable object
-        >>> output = [None for _ in gather_objects]
-        >>> dist.gather_object(
-                gather_objects[dist.get_rank()],
-                output if dist.get_rank() == 0 else None,
-                dst=0
-            )
-        >>> # On rank 0
-        >>> output
-        ['foo', 12, {1: 2}]
-    """
-    if _rank_not_in_group(group):
-        return
-
-    # Ensure object_gather_list is specified appopriately.
-    my_rank = get_rank()
-    _validate_output_list_for_rank(my_rank, dst, object_gather_list)
-    input_tensor, local_size = _object_to_tensor(obj)
-    group_backend = get_backend(group)
-    current_device = torch.device("cpu")
-    is_nccl_backend = group_backend == Backend.NCCL
-    if is_nccl_backend:
-        current_device = torch.device('cuda', torch.cuda.current_device())
-        input_tensor = input_tensor.to(current_device)
-        local_size = local_size.to(current_device)
-    # Gather all local sizes. This is so that we can find the max size, and index
-    # until the correct size when deserializing the tensors.
-    group_size = get_world_size(group=group)
-    object_sizes_tensor = torch.zeros(group_size, dtype=torch.long, device=current_device)
-    object_size_list = [
-        object_sizes_tensor[i].unsqueeze(dim=0) for i in range(group_size)
-    ]
-    # Allgather tensor sizes. An all-gather is needed here despite this being a
-    # gather, since each rank needs to broadcast a tensor of the same (maximal)
-    # size.
-    all_gather(object_size_list, local_size, group=group)
-    max_object_size = int(max(object_size_list).item())  # type: ignore
-    # Resize tensor to max size across all ranks.
-    input_tensor.resize_(max_object_size)
-    # Avoid populating output tensors if the result won't be gathered on this rank.
-    if my_rank == dst:
-        coalesced_output_tensor = torch.empty(
-            max_object_size * group_size, dtype=torch.uint8, device=current_device
-        )
-        # Output tensors are nonoverlapping views of coalesced_output_tensor
-        output_tensors = [
-            coalesced_output_tensor[max_object_size * i : max_object_size * (i + 1)]
-            for i in range(group_size)
-        ]
-    # All ranks call gather with equal-sized tensors.
-    gather(
-        input_tensor,
-        gather_list=output_tensors if my_rank == dst else None,
-        dst=dst,
-        group=group,
-    )
-    if my_rank != dst:
-        return
-    for i, tensor in enumerate(output_tensors):
-        tensor = tensor.type(torch.ByteTensor)  # type: ignore[call-overload]
-        tensor_size = object_size_list[i]
-        object_gather_list[i] = _tensor_to_object(tensor, tensor_size)
-
-
-def broadcast_object_list(object_list, src=0, group=None):
-    """
-    Broadcasts picklable objects in ``object_list`` to the whole group. Similar
-    to :func:`broadcast`, but Python objects can be passed in.
-    Note that all objects in ``object_list`` must be picklable in order to be
-    broadcasted.
-
-    Args:
-        object_list (List[Any]): List of input objects to broadcast.
-            Each object must be picklable. Only objects on the ``src`` rank will
-            be broadcast, but each rank must provide lists of equal sizes.
-        src (int): Source rank from which to broadcast ``object_list``.
-        group: (ProcessGroup, optional): The process group to work on. If None,
-            the default process group will be used. Default is ``None``.
-
-    Returns:
-        ``None``. If rank is part of the group, ``object_list`` will contain the
-        broadcasted objects from ``src`` rank.
-
-    .. note:: For NCCL-based processed groups, internal tensor representations
-        of objects must be moved to the GPU device before communication takes
-        place. In this case, the device used is given by
-        ``torch.cuda.current_device()`` and it is the user's responsiblity to
-        ensure that this is set so that each rank has an individual GPU, via
-        ``torch.cuda.set_device()``.
-
-    .. note:: Note that this API differs slightly from the :func:`all_gather`
-        collective since it does not provide an ``async_op`` handle and thus
-        will be a blocking call.
-
-    .. warning::
-        :func:`broadcast_object_list` uses ``pickle`` module implicitly, which
-        is known to be insecure. It is possible to construct malicious pickle
-        data which will execute arbitrary code during unpickling. Only call this
-        function with data you trust.
-
-    Example::
-        >>> # Note: Process group initialization omitted on each rank.
-        >>> import torch.distributed as dist
-        >>> if dist.get_rank() == 0:
-        >>>     # Assumes world_size of 3.
-        >>>     objects = ["foo", 12, {1: 2}] # any picklable object
-        >>> else:
-        >>>     objects = [None, None, None]
-        >>> dist.broadcast_object_list(objects, src=0)
-        >>> broadcast_objects
-        ['foo', 12, {1: 2}]
-    """
-    if _rank_not_in_group(group):
-        return
-
-    my_rank = get_rank()
-    # Serialize object_list elements to tensors on src rank.
-    if my_rank == src:
-        tensor_list, size_list = zip(*[_object_to_tensor(obj) for obj in object_list])
-        object_sizes_tensor = torch.cat(size_list)
-    else:
-        object_sizes_tensor = torch.LongTensor(len(object_list))
-
-    group_backend = get_backend(group)
-    is_nccl_backend = group_backend == Backend.NCCL
-    current_device = torch.device("cpu")
-    if is_nccl_backend:
-        # See note about using torch.cuda.current_device() here in docstring.
-        # We cannot simply use my_rank since rank == device is not necessarily
-        # true.
-        current_device = torch.device('cuda', torch.cuda.current_device())
-        object_sizes_tensor = object_sizes_tensor.to(current_device)
-        object_sizes_tensor = object_sizes_tensor.to(current_device)
-
-    # Broadcast object sizes
-    broadcast(object_sizes_tensor, src=src, group=group)
-
-    # Concatenate and broadcast serialized object tensors
-    if my_rank == src:
-        object_tensor = torch.cat(tensor_list)
-    else:
-        object_tensor = torch.ByteTensor(torch.sum(object_sizes_tensor).item())
-
-    if is_nccl_backend:
-        object_tensor = object_tensor.to(current_device)
-    broadcast(object_tensor, src=src, group=group)
-    # Deserialize objects using their stored sizes.
-    offset = 0
-    if my_rank != src:
-        for i, obj_size in enumerate(object_sizes_tensor):
-            obj_view = object_tensor[offset : offset + obj_size]
-            obj_view = obj_view.type(torch.ByteTensor)  # type: ignore[call-overload]
-            offset += obj_size
-            object_list[i] = _tensor_to_object(obj_view, obj_size)
-
-
-def scatter_object_list(
-    scatter_object_output_list, scatter_object_input_list, src=0, group=None
-):
-    """
-    Scatters picklable objects in ``scatter_object_input_list`` to the whole
-    group. Similar to :func:`scatter`, but Python objects can be passed in. On
-    each rank, the scattered object will be stored as the first element of
-    ``scatter_object_output_list``. Note that all objects in
-    ``scatter_object_input_list`` must be picklable in order to be scattered.
-
-    Args:
-        scatter_object_output_list (List[Any]): Non-empty list whose first
-            element will store the object scattered to this rank.
-        scatter_object_input_list (List[Any]): List of input objects to scatter.
-            Each object must be picklable. Only objects on the ``src`` rank will
-            be scattered, and the argument can be ``None`` for non-src ranks.
-        src (int): Source rank from which to scatter
-            ``scatter_object_input_list``.
-        group: (ProcessGroup, optional): The process group to work on. If None,
-            the default process group will be used. Default is ``None``.
-
-    Returns:
-        ``None``. If rank is part of the group, ``scatter_object_output_list``
-        will have its first element set to the scattered object for this rank.
-
-    .. note:: Note that this API differs slightly from the scatter collective
-        since it does not provide an ``async_op`` handle and thus will be a
-        blocking call.
-
-    .. warning::
-        :func:`scatter_object_list` uses ``pickle`` module implicitly, which
-        is known to be insecure. It is possible to construct malicious pickle
-        data which will execute arbitrary code during unpickling. Only call this
-        function with data you trust.
-
-    Example::
-        >>> # Note: Process group initialization omitted on each rank.
-        >>> import torch.distributed as dist
-        >>> if dist.get_rank() == 0:
-        >>>     # Assumes world_size of 3.
-        >>>     objects = ["foo", 12, {1: 2}] # any picklable object
-        >>> else:
-        >>>     # Can be any list on non-src ranks, elements are not used.
-        >>>     objects = [None, None, None]
-        >>> output_list = [None]
-        >>> dist.scatter_object_list(output_list, objects, src=0)
-        >>> # Rank i gets objects[i]. For example, on rank 2:
-        >>> output_list
-        [{1: 2}]
-    """
-    if _rank_not_in_group(group):
-        return
-
-    if (
-        not isinstance(scatter_object_output_list, list)
-        or len(scatter_object_output_list) < 1
-    ):
-        raise RuntimeError(
-            "Expected argument scatter_object_output_list to be a list of size at least 1."
-        )
-
-    my_rank = get_rank(group)
-    if my_rank == src:
-        tensor_list, tensor_sizes = zip(
-            *[_object_to_tensor(obj) for obj in scatter_object_input_list]
-        )
-        tensor_list, tensor_sizes = list(tensor_list), list(tensor_sizes)
-
-    obj_tensor_size = torch.LongTensor([0])
-    # Src rank broadcasts the maximum tensor size. This is because all ranks are
-    # expected to call into scatter() with equal-sized tensors.
-    if my_rank == src:
-        max_tensor_size = max(tensor_sizes)
-        for tensor in tensor_list:
-            tensor.resize_(max_tensor_size)
-    else:
-        max_tensor_size = torch.LongTensor([0])
-    broadcast(max_tensor_size, src=src, group=group)
-
-    # Scatter actual serialized objects
-    output_tensor = torch.ByteTensor(max_tensor_size.item())
-    scatter(
-        output_tensor,
-        scatter_list=None if my_rank != src else tensor_list,
-        src=src,
-        group=group,
-    )
-
-    # Scatter per-object sizes to trim tensors when deserializing back to object
-    scatter(
-        obj_tensor_size,
-        scatter_list=None if my_rank != src else tensor_sizes,
-        src=src,
-        group=group,
-    )
-
-    # Deserialize back to object
-    scatter_object_output_list[0] = _tensor_to_object(output_tensor, obj_tensor_size)
-
+        if current_rank == group_dst_rank:
+            tensor.copy_(tensor_tmp)
 
 def all_gather(tensor_list,
                tensor,
@@ -2078,78 +1461,6 @@ def scatter(tensor,
         work.wait()
 
 
-def reduce_scatter_multigpu(output_tensor_list,
-                            input_tensor_lists,
-                            op=ReduceOp.SUM,
-                            group=None,
-                            async_op=False):
-    """
-    Reduce and scatter a list of tensors to the whole group.  Only nccl backend
-    is currently supported.
-
-    Each tensor in ``output_tensor_list`` should reside on a separate GPU, as
-    should each list of tensors in ``input_tensor_lists``.
-
-    Args:
-        output_tensor_list (List[Tensor]): Output tensors (on different GPUs)
-            to receive the result of the operation.
-
-            Note that ``len(output_tensor_list)`` needs to be the same for all
-            the distributed processes calling this function.
-
-        input_tensor_lists (List[List[Tensor]]): Input lists.  It should
-            contain correctly-sized tensors on each GPU to be used for input of
-            the collective, e.g. ``input_tensor_lists[i]`` contains the
-            reduce_scatter input that resides on the GPU of
-            ``output_tensor_list[i]``.
-
-            Note that each element of ``input_tensor_lists`` has the size of
-            ``world_size * len(output_tensor_list)``, since the function
-            scatters the result from every single GPU in the group.  To
-            interpret each element of ``input_tensor_lists[i]``, note that
-            ``output_tensor_list[j]`` of rank k receives the reduce-scattered
-            result from ``input_tensor_lists[i][k * world_size + j]``
-
-            Also note that ``len(input_tensor_lists)``, and the size of each
-            element in ``input_tensor_lists`` (each element is a list,
-            therefore ``len(input_tensor_lists[i])``) need to be the same for
-            all the distributed processes calling this function.
-
-        group (ProcessGroup, optional): The process group to work on. If None,
-            the default process group will be used.
-        async_op (bool, optional): Whether this op should be an async op.
-
-    Returns:
-        Async work handle, if async_op is set to True.
-        None, if not async_op or if not part of the group.
-
-    """
-    if _rank_not_in_group(group):
-        return
-
-    opts = ReduceScatterOptions()
-    opts.reduceOp = op
-
-    if group is None:
-        default_pg = _get_default_group()
-        work = default_pg.reduce_scatter(
-            output_tensor_list,
-            input_tensor_lists,
-            opts
-        )
-    else:
-        work = group.reduce_scatter(
-            output_tensor_list,
-            input_tensor_lists,
-            opts
-        )
-
-    if async_op:
-        return work
-    else:
-        work.wait()
-
-
 def reduce_scatter(output,
                    input_list,
                    op=ReduceOp.SUM,
@@ -2190,8 +1501,8 @@ def reduce_scatter(output,
         work.wait()
 
 
-def all_to_all_single(output,
-                      input,
+def all_to_all_single(output_tensor,
+                      input_tensor,
                       output_split_sizes=None,
                       input_split_sizes=None,
                       group=None,
@@ -2270,16 +1581,16 @@ def all_to_all_single(output,
         return
 
     opts = AllToAllOptions()
-    _check_single_tensor(output, "output")
-    _check_single_tensor(input, "input")
+    _check_single_tensor(output_tensor, "output")
+    _check_single_tensor(input_tensor, "input")
     output_split_sizes = [] if output_split_sizes is None else output_split_sizes
     input_split_sizes = [] if input_split_sizes is None else input_split_sizes
 
     if group is None:
         default_pg = _get_default_group()
-        work = default_pg.alltoall_base(output, input, output_split_sizes, input_split_sizes, opts)
+        work = default_pg.alltoall_base(output_tensor, input_tensor, output_split_sizes, input_split_sizes, opts)
     else:
-        work = group.alltoall_base(output, input, output_split_sizes, input_split_sizes, opts)
+        work = group.alltoall_base(output_tensor, input_tensor, output_split_sizes, input_split_sizes, opts)
 
     if async_op:
         return work
