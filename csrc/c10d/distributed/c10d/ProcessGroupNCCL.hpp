@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef USE_C10D_NCCL
+
 #include <chrono>
 #include <iostream>
 #include <list>
@@ -13,16 +15,18 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAEvent.h>
-#include <ATen/cuda/CUDAFuture.h>
-#include <ATen/cuda/CUDAMultiStreamGuard.h>
 #include <c10/core/Stream.h>
 #include <c10/core/StreamGuard.h>
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
 #include <torch/custom_class.h>
 
 namespace c10d {
+// Environment variable which controls whether we perform a NCCL healt check
+// which ensures communicators are healthy at the beginning of init.
+constexpr const char* ENABLE_NCCL_HEALTH_CHECK = "ENABLE_NCCL_HEALTH_CHECK";
 
 // Environment variable which controls whether or not wait() is blocking or
 // non-blocking.
@@ -31,6 +35,10 @@ constexpr const char* NCCL_BLOCKING_WAIT = "NCCL_BLOCKING_WAIT";
 // Environment variable which controls whether or not we perform Async Error
 // Handling with NCCL.
 constexpr const char* NCCL_ASYNC_ERROR_HANDLING = "NCCL_ASYNC_ERROR_HANDLING";
+
+// Environment Variable to control whether Desync Debug is enabled.
+// This variable must be set together with NCCL_ASYNC_ERROR_HANDLING.
+constexpr const char* NCCL_DESYNC_DEBUG = "NCCL_DESYNC_DEBUG";
 
 constexpr const char* NCCL_BACKEND_NAME = "nccl";
 
@@ -69,19 +77,29 @@ constexpr const char* NCCL_BACKEND_NAME = "nccl";
 //   work->wait()
 //
 //   // Now continue on other work in the current stream.
-class ProcessGroupNCCL : public ProcessGroup {
+class TORCH_API ProcessGroupNCCL : public ProcessGroup {
  public:
   class WorkNCCL : public ProcessGroup::Work,
     public std::enable_shared_from_this<WorkNCCL> {
    public:
     // Constructor takes a list of CUDA devices
-    WorkNCCL(const std::vector<at::Device>& devices, int rank, OpType opType, const char* profilingTitle = nullptr);
+    WorkNCCL(
+        const std::vector<at::Device>& devices,
+        int rank,
+        OpType opType,
+        uint64_t seq,
+        const char* profilingTitle = nullptr,
+        const c10::optional<std::vector<at::Tensor>>& inputs = c10::nullopt,
+        bool desyncDebug = false);
     // Copy constructor doing partial copy without outputs_. Cleanup thread
     // monitors and removes finished works. However it will deadlock when
     // destructs outputs_ tensors who are view tensors in autograd graph.
     WorkNCCL(const WorkNCCL& w);
 
     virtual ~WorkNCCL();
+
+    // Checks if the NCCL kernel has started to execute.
+    bool isStarted();
 
     // Checks if request has completed. In this specific case of NCCL, it checks
     // if the NCCL operation has completed on the GPU in its own NCCL stream.
@@ -112,7 +130,6 @@ class ProcessGroupNCCL : public ProcessGroup {
     bool finishedGPUExecution();
 
     // Get a Future object that will be marked as completed internally.
-    // It actually returns a CUDAFuture object which is a sub class of Future.
     c10::intrusive_ptr<c10::ivalue::Future> getFuture() override;
 
     // Helper function that sets an exception_ptr on the WorkNCCL object.
@@ -128,8 +145,14 @@ class ProcessGroupNCCL : public ProcessGroup {
     // The cached list of CUDA devices to operate on
     std::vector<at::Device> devices_;
 
-    // The CUDA events tracking this work item on multiple CUDA devices
-    std::shared_ptr<std::vector<at::cuda::CUDAEvent>> cudaEvents_;
+    // The start CUDA events of NCCL operator tracking this work item on
+    // multiple CUDA devices. These start CUDA events are needed by desync
+    // debugging if enabled.
+    std::shared_ptr<std::vector<at::cuda::CUDAEvent>> ncclStartEvents_;
+
+    // The end CUDA events of NCCL operator tracking this work item on
+    // multiple CUDA devices.
+    std::shared_ptr<std::vector<at::cuda::CUDAEvent>> ncclEndEvents_;
 
     // The NCCL communicators used for this work item.
     std::vector<std::shared_ptr<NCCLComm>> ncclComms_;
@@ -145,6 +168,13 @@ class ProcessGroupNCCL : public ProcessGroup {
 
     // Time point representing when the work started.
     std::chrono::time_point<std::chrono::steady_clock> workStartTime_;
+
+    // Record the collective sequential number.
+    uint64_t seq_;
+
+    // Indicates if the nccl start event has been updated to the store trace.
+    // This will be used by desync debug.
+    bool startTraceUpdated_{false};
 
     // Wrapper method for the static checkForNCCLErrors which can be overridden
     // for tests.
@@ -164,6 +194,10 @@ class ProcessGroupNCCL : public ProcessGroup {
     // Checks for NCCL errors and throws an appropriate exception.
     void checkAndThrowException();
 
+    // Just checks whether GPU execution has started, without modifying
+    // exception_ptr.
+    bool startedGPUExecutionInternal() const;
+
     // Just checks whether GPU execution has completed, without modifying
     // exception_ptr.
     bool finishedGPUExecutionInternal() const;
@@ -177,23 +211,25 @@ class ProcessGroupNCCL : public ProcessGroup {
     std::shared_ptr<std::vector<at::Tensor>> outputs_;
 
     // The future returned by getFuture.
-    c10::intrusive_ptr<at::cuda::CUDAFuture> future_;
+    c10::intrusive_ptr<at::ivalue::Future> future_;
 
     friend class ProcessGroupNCCL;
   };
 
-  struct Options : torch::CustomClassHolder {
-    explicit Options();
+  struct Options : ProcessGroup::Options {
+    // NOTE: timeout in ProcessGroupNCCL::Options denote the timeout for
+    // operations. This is only used when blockingWait_ is enabled.
+    explicit Options(
+        bool is_high_priority_stream = false);
 
     // return intrusive_ptr of the object
     static c10::intrusive_ptr<Options> create(
-        std::chrono::milliseconds timeout = kNoTimeout,
-        bool isHighStream = false) {
-      return c10::make_intrusive<Options>();
+        bool is_high_priority_stream = false) {
+      return c10::make_intrusive<Options>(is_high_priority_stream);
     }
 
-    std::chrono::milliseconds opTimeout;
-    bool isHighPriorityStream;
+    // Schedule NCCL operations on high priority CUDA streams
+    bool is_high_priority_stream;
   };
 
   // If you wish to create multiple process groups, each with a potentially
@@ -229,6 +265,10 @@ class ProcessGroupNCCL : public ProcessGroup {
 
   virtual ~ProcessGroupNCCL();
 
+  c10::intrusive_ptr<Options> getOptions() {
+    return options_;
+  }
+
   const std::string getBackendName() const override {
       return std::string(NCCL_BACKEND_NAME);
   }
@@ -255,7 +295,7 @@ class ProcessGroupNCCL : public ProcessGroup {
       std::vector<at::Tensor>& inputTensors,
       const AllgatherOptions& opts = AllgatherOptions()) override;
 
-  c10::intrusive_ptr<ProcessGroup::Work> allgather_base(
+  c10::intrusive_ptr<ProcessGroup::Work> _allgather_base(
       at::Tensor& outputbuffer,
       at::Tensor& inputbuffer,
       const AllgatherOptions& opts = AllgatherOptions()) override;
@@ -268,6 +308,11 @@ class ProcessGroupNCCL : public ProcessGroup {
   c10::intrusive_ptr<ProcessGroup::Work> reduce_scatter(
       std::vector<at::Tensor>& outputTensors,
       std::vector<std::vector<at::Tensor>>& inputTensors,
+      const ReduceScatterOptions& opts = ReduceScatterOptions()) override;
+
+  c10::intrusive_ptr<ProcessGroup::Work> _reduce_scatter_base(
+      at::Tensor& outputTensor,
+      at::Tensor& inputTensor,
       const ReduceScatterOptions& opts = ReduceScatterOptions()) override;
 
   c10::intrusive_ptr<ProcessGroup::Work> barrier(
@@ -314,7 +359,14 @@ class ProcessGroupNCCL : public ProcessGroup {
       std::vector<at::Tensor>& tensors,
       int tag) override;
 
-  static const int64_t kProcessGroupNCCLOpTimeoutMillis;
+   // Agrees on an initial sequence number for the whole group by having rank 0
+  // create it and broadcast it to other ranks using the store.
+  void setSequenceNumberForGroup() override;
+
+  // Retrieves the current sequence number for the whole group, which should be
+  // in sync. If the returned number is not consistent across the group, it
+  // may indicate that there is some sort of collective desynchronization.
+  uint64_t getSequenceNumberForGroup() override;
 
  protected:
   // Helper that broadcasts nccl unique ID to all ranks through the store
@@ -341,7 +393,8 @@ class ProcessGroupNCCL : public ProcessGroup {
       std::vector<at::Device> devices,
       int rank,
       OpType opType,
-      const char* profilingTitle=nullptr);
+      const char* profilingTitle=nullptr,
+      const c10::optional<std::vector<at::Tensor>>& inputs = c10::nullopt);
 
  private:
   // Helper that encapsulates work shared across all collective communication
@@ -375,7 +428,8 @@ class ProcessGroupNCCL : public ProcessGroup {
       std::vector<at::Tensor>& tensor,
       Fn fn,
       int peer,
-      OpType opType);
+      OpType opType,
+      const char* profilingTitle = nullptr);
   template <typename Fn, typename PreProcess, typename PostProcess>
   c10::intrusive_ptr<ProcessGroup::Work> pointToPoint(
       std::vector<at::Tensor>& tensor,
@@ -383,7 +437,12 @@ class ProcessGroupNCCL : public ProcessGroup {
       int peer,
       OpType opType,
       PreProcess pre,
-      PostProcess post);
+      PostProcess post,
+      const char* profilingTitle);
+
+  c10::intrusive_ptr<ProcessGroup::Work> allreduce_impl(
+      std::vector<at::Tensor>& tensors,
+      const AllreduceOptions& opts = AllreduceOptions());
 
   // Checks for NCCL errors on each of the communicators and returns an
   // appropriate exception_ptr (nullptr if no errors).
@@ -409,6 +468,18 @@ class ProcessGroupNCCL : public ProcessGroup {
   void abortTimedOutCollectives(
       std::unordered_set<std::string>& abortedCommIds);
 
+  // Performs a health check by initializing dummy NCCL communicators and then
+  // destroying them. This will help indicate and signal any NCCL-related issues
+  // prior to the first collective. The actual initialization and subsequent
+  // destruction is ran on a separate thread and the main thread is signalled
+  // about timeouts/errors to report to the application.
+  void runHealthCheck();
+
+  // Destroys initialized NCCL communicators in devNCCLComMap_ given by input
+  // key. Throws if there are no communicators to destroy. Also removes
+  // communicators from the cache and clears used device indices.
+  void destroyNCCLComms(const std::string& devNCCLCommMapKey);
+
   void workCleanupLoop();
 
  protected:
@@ -418,10 +489,20 @@ class ProcessGroupNCCL : public ProcessGroup {
   // The store is used to broadcast the NCCL unique ID of rank 0.
   c10::intrusive_ptr<Store> store_;
 
+  bool storeError_{false};
+
+  const c10::intrusive_ptr<Options> options_;
+
   // The number of NCCL communicators that have been created during
   // the lifetime of this process group. This sequence number is
   // used to scope keys used in the store.
   uint64_t ncclCommCounter_{0};
+
+  // The store keys to trace the last NCCL collective kernel CUDA events - start
+  // event and end event respectively. These are used to do desync root cause
+  // analysis.
+  const std::string traceKeyStart_;
+  const std::string traceKeyEnd_;
 
   // The NCCL communicator that the process group has cached.
   //
@@ -522,12 +603,12 @@ class ProcessGroupNCCL : public ProcessGroup {
   // for the operation to complete.
   bool blockingWait_ = false;
 
-  // Whether ot not the workCleanupThread is used to perform async error
+  // Whether or not the workCleanupThread is used to perform async error
   // handling.
   bool asyncErrorHandling_ = false;
 
-  // Timeout for operations. This is only used when blockingWait_ is enabled.
-  std::chrono::milliseconds opTimeout_;
+  // Whether or not to enable timeout root cause analysis.
+  bool desyncDebug_;
 
   // Set of communicators that this process group has aborted and their
   // ncclUniqueId has been written to the store. We don't need a lock
@@ -535,13 +616,15 @@ class ProcessGroupNCCL : public ProcessGroup {
   // set contains the string representation of ncclUniqueId.
   std::unordered_set<std::string> abortedComms_;
 
-  // Schedule NCCL operations on high priority CUDA streams.
-  bool isHighPriorityStream_ = false;
-
   // The number of active ncclGroupStart() calls. This counter will be increased
   // by 1 when ncclGroupStart() is called and decreased by 1 when ncclGroupEnd()
   // is called.
   static thread_local uint64_t ncclActiveGroupCounter_;
+
+  // Counting for the sequential number of NCCL collective call.
+  uint64_t seq_{0};
 };
 
 } // namespace c10d
+
+#endif // USE_C10D_NCCL
